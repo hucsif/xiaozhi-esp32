@@ -15,6 +15,8 @@
 #include "application.h"
 #include "button.h"
 #include "config.h"
+#include "mcp_server.h"
+#include "radar.h"
 
 #include <driver/gpio.h>
 #include <driver/spi_common.h>
@@ -22,6 +24,9 @@
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
 #include <esp_log.h>
+
+#include <cstdio>
+#include <string>
 
 #define TAG "Esp32S3Wroom1UN16R8"
 
@@ -104,12 +109,108 @@ private:
         });
     }
 
+    /* 雷达：R60ABD1（呼吸/心率）+ LD2450（运动追踪）。
+     *
+     * setup_radar()      配两路 UART + 解析器（非阻塞）
+     * task_setup_radar() 起 10ms 轮询任务
+     *
+     * 采集是**纯本地、一直跑**的 —— 本版没有状态上报、也没有网络门控：
+     * 消费方（下面 InitializeTools 注册的 MCP 工具）什么时候来问，
+     * 什么时候读一次 radar_snapshot()。 */
+    void InitializeRadar() {
+        if (!setup_radar()) {
+            /* 雷达挂了不该拖垮整机 —— 屏幕/音频照常。工具会返回「测不到」 */
+            ESP_LOGE(TAG, "雷达 UART 初始化失败：雷达功能不可用，其余外设不受影响");
+            return;
+        }
+        task_setup_radar();
+    }
+
+    /* 雷达数据 → MCP 工具（LLM 主动来查）。
+     *
+     * ⚠️ 刻意拆成**三个单值工具**，不做成一个返回全部字段的工具。
+     *    这是原项目实测两次踩坑换来的结论：
+     *      · 一个工具返回 {方位,距离,心率,呼吸} → 模型把四个数值**全念一遍**；
+     *      · 缩成「心率+呼吸」两字段        → 模型**问呼吸却报心率**
+     *        （两个值都在上下文里，它挑错了）；
+     *      · 拆成单值工具 ✅               → 问什么答什么 ——
+     *        没被问到的数据**根本不进上下文**，模型既没法顺带报也没法挑错。
+     *
+     * 回调返回 std::string 就是给 LLM 的文本（这里给 JSON）。
+     * 测不到时返回显式 note，而不是空对象 —— 否则模型容易拿别的数来凑答案。 */
+    void InitializeTools() {
+        auto& mcp_server = McpServer::GetInstance();
+
+        mcp_server.AddTool(
+            "self.radar.get_heart_rate",
+            "读取用户当前的**实时**心率（次/分，雷达生理感知）。"
+            "**用户每次问自己的心跳/心率时都必须重新调用本工具**，"
+            "禁止凭记忆、猜测、或直接复用上一轮的结果回答（读数每几秒在变）。"
+            "呼吸率是另一个工具 self.radar.get_breath_rate —— 用户问呼吸时不要用本工具，"
+            "也不要用这里的心率数值去顶替。"
+            "返回里没有 heart_rate 表示当前测不到，如实说明即可。",
+            PropertyList(),
+            [](const PropertyList&) -> ReturnValue {
+                const radar_snapshot_t s = radar_snapshot();
+                char buf[80];
+                if (s.heart_rate > 0) {
+                    snprintf(buf, sizeof(buf), "{\"heart_rate\": %u}", (unsigned)s.heart_rate);
+                } else {
+                    snprintf(buf, sizeof(buf), "{\"note\": \"当前测不到心率\"}");
+                }
+                return std::string(buf);
+            });
+
+        mcp_server.AddTool(
+            "self.radar.get_breath_rate",
+            "读取用户当前的**实时**呼吸率（次/分，雷达生理感知）。"
+            "**用户每次问自己的呼吸/呼吸频次时都必须重新调用本工具**，"
+            "禁止凭记忆、猜测、或直接复用上一轮的结果回答（读数每几秒在变）。"
+            "心率是另一个工具 self.radar.get_heart_rate —— 用户问心率时不要用本工具，"
+            "也不要用这里的呼吸数值去顶替。"
+            "返回里没有 breath_rate 表示当前测不到，如实说明即可。",
+            PropertyList(),
+            [](const PropertyList&) -> ReturnValue {
+                const radar_snapshot_t s = radar_snapshot();
+                char buf[80];
+                if (s.breath_rate > 0) {
+                    snprintf(buf, sizeof(buf), "{\"breath_rate\": %u}", (unsigned)s.breath_rate);
+                } else {
+                    snprintf(buf, sizeof(buf), "{\"note\": \"当前测不到呼吸率\"}");
+                }
+                return std::string(buf);
+            });
+
+        mcp_server.AddTool(
+            "self.radar.get_position",
+            "读取用户相对机器人的**当前**方位与距离（雷达运动追踪，实时变化）。"
+            "**用户每次问自己在哪里/什么方位/离机器人多远时，都必须重新调用本工具**，"
+            "禁止凭记忆、猜测、或直接复用上一轮的结果回答 —— 人随时在移动，"
+            "上一次的方位很可能已经不对了。"
+            "只回答方位与距离，不要顺带报心率/呼吸。"
+            "返回里没有 where 表示雷达暂时没检到人（人极静时运动雷达可能丢），如实说明。",
+            PropertyList(),
+            [](const PropertyList&) -> ReturnValue {
+                const radar_snapshot_t s = radar_snapshot();
+                char where[64];
+                char buf[128];
+                if (radar_where_text(&s, where, sizeof(where))) {
+                    snprintf(buf, sizeof(buf), "{\"where\": \"%s\"}", where);
+                } else {
+                    snprintf(buf, sizeof(buf), "{\"note\": \"雷达暂时没检到人\"}");
+                }
+                return std::string(buf);
+            });
+    }
+
 public:
     Esp32S3Wroom1UN16R8() : boot_button_(BOOT_BUTTON_GPIO) {
         InitializePaControl();
         InitializeSpi();
         InitializeLcdDisplay();
         InitializeButtons();
+        InitializeRadar();
+        InitializeTools();
     }
 
     /* 音频：PDM 数字麦 + I2S 标准功放。
