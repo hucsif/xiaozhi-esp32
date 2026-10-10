@@ -635,6 +635,9 @@ choice BOARD_TYPE
     config BOARD_TYPE_ZHENGCHEN_CAM
         bool "Zhengchen AI Camera Wi-Fi (征辰科技)"
         depends on IDF_TARGET_ESP32S3
+    config BOARD_TYPE_ESP32_S3_WROOM_1U_N16R8
+        bool "ESP32-S3-WROOM-1U-N16R8 (小歪 Deskbot v2 主控板)"
+        depends on IDF_TARGET_ESP32S3
 endchoice
 
 choice XIAOZHI_NETWORK_TYPE

@@ -1,0 +1,13 @@
+{
+    "type": "esp32-s3-wroom-1u-n16r8",
+    "target": "esp32s3",
+    "builds": [
+        {
+            "name": "esp32-s3-wroom-1u-n16r8",
+            "sdkconfig_append": [
+                "CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y",
+                "CONFIG_SPIRAM_MODE_OCT=y"
+            ]
+        }
+    ]
+}
