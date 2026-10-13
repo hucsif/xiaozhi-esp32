@@ -17,6 +17,7 @@
 #include "config.h"
 #include "mcp_server.h"
 #include "radar.h"
+#include "servo.h"
 
 #include <driver/gpio.h>
 #include <driver/spi_common.h>
@@ -126,6 +127,23 @@ private:
         task_setup_radar();
     }
 
+    /* 舵机：水平转向说话人（X 轴 GPIO16）。
+     *
+     * setup_servo()      配 LEDC（50Hz / 13bit / 500~2500µs）+ 写开机归中角
+     * task_setup_servo() 起 20ms 任务（对话期间持续跟踪说话人，退出对话自动回中）
+     *
+     * 转向的方向取自 radar_snapshot()，与自己 InitializeTools() 里那个
+     * self.radar.get_position 工具**同一个数据源** —— 所以「LLM 说的方位」和
+     * 「头转的方向」必然一致，不会出现一个说左、一个往右转。
+     *
+     * 失败不该拖垮整机：setup 不成就直接不建任务，雷达/屏幕/音频照常工作。 */
+    void InitializeServo() {
+        if (!setup_servo()) {
+            return;
+        }
+        task_setup_servo();
+    }
+
     /* 雷达数据 → MCP 工具（LLM 主动来查）。
      *
      * ⚠️ 刻意拆成**三个单值工具**，不做成一个返回全部字段的工具。
@@ -210,6 +228,7 @@ public:
         InitializeLcdDisplay();
         InitializeButtons();
         InitializeRadar();
+        InitializeServo();
         InitializeTools();
     }
 
